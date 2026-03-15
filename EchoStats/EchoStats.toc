@@ -5,6 +5,7 @@
 ## OptionalDeps: EHTweaks
 ## SavedVariables: EchoStatsDB
 ## Author: Claude (for Steve)
-## Version: 1.0.0
+## Contributors: CondemGames
+## Version: 1.1.3
 
 EchoStats.lua
