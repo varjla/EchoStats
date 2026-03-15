@@ -18,6 +18,20 @@ local C_GREEN = "|cff00ff00"
 local C_RED   = "|cffff4444"
 local C_GREY  = "|cff888888"
 
+-- Database integer to Hex Quality map
+local QUALITY_HEX = {
+    [0] = "ffffffff",   -- Common (White) 
+    [1] = "ff1aff1a",   -- Uncommon (Green)
+    [2] = "ff0066ff",   -- Rare (Blue)
+    [3] = "ff9933ff",   -- Epic (Purple)
+    [4] = "ffff8000",   -- Legendary (Orange)
+}
+
+local function GetEchoQualityHex(quality)
+    if not quality then return QUALITY_HEX[0] end
+    return QUALITY_HEX[quality] or QUALITY_HEX[0]
+end
+
 EchoStatsDB = EchoStatsDB or {}
 
 local STAT_MAP = {
@@ -30,6 +44,7 @@ local STAT_MAP = {
 }
 
 local echoStatsCache = {}
+local echoSourcesCache = {}
 local echoCacheTime = 0
 local ECHO_CACHE_TTL = 5
 local spellStatsCache = {}
@@ -253,26 +268,64 @@ end
 -- =============================================================================
 local function CalculateAllEchoStats()
     local now = GetTime()
-    if (now-echoCacheTime)<ECHO_CACHE_TTL and next(echoStatsCache) then return echoStatsCache end
+    if (now-echoCacheTime)<ECHO_CACHE_TTL and next(echoStatsCache) then return echoStatsCache, echoSourcesCache end
     local total = {}
-    if not ProjectEbonhold or not ProjectEbonhold.PerkService then return total end
-    local fn = ProjectEbonhold.PerkService.GetGrantedPerks; if not fn then return total end
-    local ok, granted = pcall(fn); if not ok or not granted then return total end
-    for _, instances in pairs(granted) do
+    local sources = {}
+    if not ProjectEbonhold or not ProjectEbonhold.PerkService then return total, sources end
+    local fn = ProjectEbonhold.PerkService.GetGrantedPerks; if not fn then return total, sources end
+    local ok, granted = pcall(fn); if not ok or not granted then return total, sources end
+    for perkName, instances in pairs(granted) do
         if type(instances) == "table" then
             for _, info in ipairs(instances) do
                 if info.spellId then
                     local stats = GetSpellStats(info.spellId, info.stack or 1)
-                    for k, v in pairs(stats) do total[k] = (total[k] or 0) + v end
+                    for k, v in pairs(stats) do
+                        local r = 4 -- fallback epic
+                        if info.quality then r = info.quality end
+
+                        if ProjectEbonhold and ProjectEbonhold.PerkDatabase and ProjectEbonhold.PerkDatabase[info.spellId] then
+                            local dbQuality = ProjectEbonhold.PerkDatabase[info.spellId].quality
+                            if type(dbQuality) == "string" then
+                                local rLower = dbQuality:lower()
+                                if rLower == "poor" then r = 0
+                                elseif rLower == "common" then r = 1
+                                elseif rLower == "uncommon" then r = 2
+                                elseif rLower == "rare" then r = 3
+                                elseif rLower == "epic" then r = 4
+                                elseif rLower == "legendary" then r = 5
+                                elseif rLower == "artifact" then r = 6
+                                end
+                            elseif type(dbQuality) == "number" then
+                                r = dbQuality
+                            end
+                        end
+                        total[k] = (total[k] or 0) + v
+                        sources[k] = sources[k] or {}
+                        
+                        -- Group by name + quality + base value
+                        local found = false
+                        for _, existing in ipairs(sources[k]) do
+                            if existing.name == tostring(perkName) and existing.quality == r and existing.baseValue == v then
+                                existing.value = existing.value + v
+                                existing.count = existing.count + 1
+                                found = true
+                                break
+                            end
+                        end
+                        
+                        if not found then
+                            table.insert(sources[k], {name = tostring(perkName), value = v, count = 1, quality = r, baseValue = v})
+                        end
+                    end
                 end
             end
         end
     end
-    echoStatsCache = total; echoCacheTime = now; return total
+    echoStatsCache = total; echoSourcesCache = sources; echoCacheTime = now; return total, sources
 end
 
-local function InvalidateCache() echoCacheTime=0; echoStatsCache={} end
-local function FullInvalidate() echoCacheTime=0; echoStatsCache={}; spellStatsCache={} end
+local function InvalidateCache() echoCacheTime=0; echoStatsCache={}; echoSourcesCache={} end
+local function FullInvalidate() echoCacheTime=0; echoStatsCache={}; spellStatsCache={}; echoSourcesCache={} end
 
 local function Fmt(v) if v==math.floor(v) then return tostring(math.floor(v)) end; return format("%.1f",v) end
 local function FmtPct(v) return format("%.2f%%",v) end
@@ -290,8 +343,21 @@ local function BuildPanel()
         tile=true, tileSize=16, edgeSize=12, insets={left=2,right=2,top=2,bottom=2} })
     panel:SetBackdropColor(0.05,0.05,0.08,0.92); panel:SetBackdropBorderColor(0.3,0.3,0.3,0.8)
     panel:SetFrameStrata("HIGH")
-    panel:SetPoint("TOPLEFT",PaperDollFrame,"TOPRIGHT",-2,0)
-    panel:SetPoint("BOTTOMLEFT",PaperDollFrame,"BOTTOMRIGHT",-2,0); panel:EnableMouse(true)
+    if EchoStatsDB.panelPos then
+        panel:SetPoint(EchoStatsDB.panelPos[1], UIParent, EchoStatsDB.panelPos[2], EchoStatsDB.panelPos[3], EchoStatsDB.panelPos[4])
+    else
+        panel:SetPoint("TOPLEFT",PaperDollFrame,"TOPRIGHT",-2,0)
+    end
+    panel:SetHeight(424)
+    panel:EnableMouse(true)
+    panel:SetMovable(true)
+    panel:RegisterForDrag("LeftButton")
+    panel:SetScript("OnDragStart", panel.StartMoving)
+    panel:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        local p, _, rp, x, y = self:GetPoint()
+        EchoStatsDB.panelPos = {p, rp, x, y}
+    end)
 
     local tb=panel:CreateTexture(nil,"ARTWORK"); tb:SetTexture("Interface\\Buttons\\WHITE8X8")
     tb:SetVertexColor(0.12,0.12,0.18,1); tb:SetHeight(20); tb:SetPoint("TOPLEFT",2,-2); tb:SetPoint("TOPRIGHT",-2,-2)
@@ -369,18 +435,89 @@ local function ArmorBreak(l,base,pos,neg,ev) local g=pos-ev; if g<0 then g=0 end
     if neg<0 then table.insert(l,RLine(format("  Debuffs: %d",neg))) end end
 
 -- =============================================================================
+-- Shared Logic
+-- =============================================================================
+
+local scanner = CreateFrame("GameTooltip", "EchoStats_Scanner", UIParent, "GameTooltipTemplate")
+
+local function GetChronoboostHastePercent()
+    local filters = {"HELPFUL", "HARMFUL"}
+    for _, filter in ipairs(filters) do
+        for i = 1, 40 do
+            local name = UnitAura("player", i, filter)
+            if not name then break end
+            if name == "Chronoboost" then
+                scanner:SetOwner(WorldFrame, "ANCHOR_NONE")
+                scanner:ClearLines()
+                scanner:SetUnitAura("player", i, filter)
+                for j = 1, scanner:NumLines() do
+                    local line = _G["EchoStats_ScannerTextLeft" .. j]
+                    if line then
+                        local text = line:GetText()
+                        if text then
+                            -- e.g. "Haste increased by 2%."
+                            local pct = text:match("(%d+)%%")
+                            if pct then
+                                return tonumber(pct) or 0
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return 0
+end
+
+-- =============================================================================
 -- Populate panel
 -- =============================================================================
 local function PopulatePanel()
     if not panel or not scrollChild then return end; ReleaseAll()
-    local echo = CalculateAllEchoStats(); local y = 0; local used = {}
+    local echo, echoSources = CalculateAllEchoStats(); local y = 0; local used = {}
     local function Sec(t) y=y-GAP; AcquireHeader(y,t); y=y-HDR_H end
     local function Row(label,value,ek,tipT,tipL)
         local row=AcquireRow(y); row.label:SetText(C_LABEL..label..":|r")
         row.value:SetText(C_VALUE..(value~=nil and tostring(value) or "").."|r")
-        local ev=0; if ek then if type(ek)=="table" then for _,k in ipairs(ek) do ev=ev+(echo[k] or 0); used[k]=true end
-            else ev=echo[ek] or 0; used[ek]=true end end
+        local ev=0; local slist={}
+        if ek then if type(ek)=="table" then for _,k in ipairs(ek) do 
+                ev=ev+(echo[k] or 0); used[k]=true
+                if echoSources and echoSources[k] then for _,s in ipairs(echoSources[k]) do table.insert(slist,s) end end
+            end
+            else 
+                ev=echo[ek] or 0; used[ek]=true
+                if echoSources and echoSources[ek] then for _,s in ipairs(echoSources[ek]) do table.insert(slist,s) end end
+            end 
+        end
         row.echo:SetText(ev>0 and (C_ECHO.."(+"..Fmt(ev)..")|r ") or "")
+        
+        if ev>0 and #slist>0 then
+            table.insert(tipL, BLine()); table.insert(tipL, HLine("--- Echoes ---"))
+            
+            -- Sort: Alphabetically first, then by quality (ascending: 1=Common, 5=Legendary)
+            table.sort(slist, function(a,b) 
+                if a.name == b.name then
+                    return a.quality < b.quality
+                end
+                return a.name < b.name 
+            end)
+            
+            for _,s in ipairs(slist) do 
+                local multTxt = ""
+                local valTxt = Fmt(s.value)
+                if s.count > 1 then
+                    multTxt = format(" (+%s)(x%d)", Fmt(s.baseValue), s.count)
+                    valTxt = format("%s%s", Fmt(s.value), multTxt)
+                end
+
+                local colorHex = "|c" .. GetEchoQualityHex(s.quality)
+                -- GetEchoQualityHex returns hex string, so we prepend "|c" to it directly
+                local coloredName = colorHex and (colorHex..s.name.."|r") or s.name
+                
+                table.insert(tipL, {text=format("  %s: +%s", coloredName, valTxt), r=0, g=1, b=0.8, wrap=false}) 
+            end
+        end
+
         SetRowTip(row,tipT or label,tipL); y=y-ROW_H end
 
     Sec("Base Stats")
@@ -413,7 +550,11 @@ local function PopulatePanel()
     do local r=GetCombatRating(CR_HIT_MELEE); local ev=echo["hit"] or 0
         local l={NLine(format("+%.2f%%",GetCombatRatingBonus(CR_HIT_MELEE)))}; RatingBreakdown(l,r,ev); Row("Hit",r,"hit","Hit "..r,l) end
     do local r=GetCombatRating(CR_HASTE_MELEE); local rb=GetCombatRatingBonus(CR_HASTE_MELEE); local ev=echo["haste"] or 0
-        local l={NLine(format("%d = %.2f%%",r,rb))}; RatingBreakdown(l,r,ev); Row("Haste",FmtPct(rb),"haste","Haste "..FmtPct(rb),l) end
+        local cbPct = GetChronoboostHastePercent()
+        local totalPct = rb + cbPct
+        local l={NLine(format("From rating: %d = %.2f%%",r,rb))}
+        if cbPct > 0 then table.insert(l, NLine(format("Chronoboost buff: +%d%%", cbPct))) end
+        RatingBreakdown(l,r,ev); Row("Haste",FmtPct(totalPct),"haste","Haste "..FmtPct(totalPct),l) end
     do local exp=GetExpertise(); local r=GetCombatRating(CR_EXPERTISE); local ev=echo["exp"] or 0
         local l={NLine(format("-%.2f%% dodge",GetExpertisePercent()))}; RatingBreakdown(l,r,ev); Row("Expertise",exp,"exp","Exp "..exp,l) end
     do local r=GetCombatRating(CR_ARMOR_PENETRATION); local ev=echo["arp"] or 0
@@ -426,6 +567,12 @@ local function PopulatePanel()
         local l={NLine(format("Total crit: %.2f%%",c)),NLine(format("From rating: %d = %.2f%%",r,rb))}; RatingBreakdown(l,r,ev); Row("R.Crit",FmtPct(c),"crit","Ranged Crit",l) end
     do local r=GetCombatRating(CR_HIT_RANGED); local ev=echo["hit"] or 0
         local l={NLine(format("+%.2f%%",GetCombatRatingBonus(CR_HIT_RANGED)))}; RatingBreakdown(l,r,ev); Row("R.Hit",r,"hit","R.Hit "..r,l) end
+    do local r=GetCombatRating(CR_HASTE_RANGED); local rb=GetCombatRatingBonus(CR_HASTE_RANGED); local ev=echo["haste"] or 0
+        local cbPct = GetChronoboostHastePercent()
+        local totalPct = rb + cbPct
+        local l={NLine(format("From rating: %d = %.2f%%",r,rb))}
+        if cbPct > 0 then table.insert(l, NLine(format("Chronoboost buff: +%d%%", cbPct))) end
+        RatingBreakdown(l,r,ev); Row("R.Haste",FmtPct(totalPct),"haste","Haste "..FmtPct(totalPct),l) end
 
     Sec("Spell")
     do local mx=0; for i=2,7 do local sp=GetSpellBonusDamage(i); if sp and sp>mx then mx=sp end end
@@ -437,7 +584,11 @@ local function PopulatePanel()
     do local r=GetCombatRating(CR_HIT_SPELL); local ev=echo["hit"] or 0
         local l={NLine(format("+%.2f%%",GetCombatRatingBonus(CR_HIT_SPELL)))}; RatingBreakdown(l,r,ev); Row("S.Hit",r,"hit","S.Hit "..r,l) end
     do local r=GetCombatRating(CR_HASTE_SPELL); local rb=GetCombatRatingBonus(CR_HASTE_SPELL); local ev=echo["haste"] or 0
-        local l={NLine(format("%d = %.2f%%",r,rb))}; RatingBreakdown(l,r,ev); Row("S.Haste",FmtPct(rb),"haste","S.Haste "..FmtPct(rb),l) end
+        local cbPct = GetChronoboostHastePercent()
+        local totalPct = rb + cbPct
+        local l={NLine(format("From rating: %d = %.2f%%",r,rb))}
+        if cbPct > 0 then table.insert(l, NLine(format("Chronoboost buff: +%d%%", cbPct))) end
+        RatingBreakdown(l,r,ev); Row("S.Haste",FmtPct(totalPct),"haste","S.Haste "..FmtPct(totalPct),l) end
     do local b,c=GetManaRegen(); if b then local m5B=math.floor(b*5); local m5C=math.floor(c*5); local ev=echo["mp5"] or 0
         local l={NLine(format("Spirit: %d / Cast: %d",m5B,m5C))}; if ev>0 then table.insert(l,ELine(format("Echoes: +%s",Fmt(ev)))) end
         Row("MP5(cast)",m5C,"mp5","MP5",l); Row("MP5(spi)",m5B,"mp5","MP5",l) end end
@@ -466,7 +617,37 @@ local function PopulatePanel()
         if not hasX then Sec("Echo-Only"); hasX=true end
         local lbl=STAT_MAP[k] or k; local row=AcquireRow(y)
         row.label:SetText(C_LABEL..lbl..":|r"); row.value:SetText(""); row.echo:SetText(C_ECHO.."+"..Fmt(echo[k]).."|r")
-        SetRowTip(row,"Echo: "..lbl,{ELine(format("+%s",Fmt(echo[k])))})
+        
+        local slist = {}
+        if echoSources and echoSources[k] then for _,s in ipairs(echoSources[k]) do table.insert(slist,s) end end
+        local tipL = {ELine(format("+%s",Fmt(echo[k])))}
+        if #slist>0 then
+            table.insert(tipL, BLine()); table.insert(tipL, HLine("--- Echoes ---"))
+            
+            -- Sort: Alphabetically first, then by quality (ascending: 1=Common, 5=Legendary)
+            table.sort(slist, function(a,b) 
+                if a.name == b.name then
+                    return a.quality < b.quality
+                end
+                return a.name < b.name 
+            end)
+            
+            for _,s in ipairs(slist) do 
+                local multTxt = ""
+                local valTxt = Fmt(s.value)
+                if s.count > 1 then
+                    multTxt = format(" (+%s)(x%d)", Fmt(s.baseValue), s.count)
+                    valTxt = format("%s%s", Fmt(s.value), multTxt)
+                end
+
+                local colorHex = "|c" .. GetEchoQualityHex(s.quality)
+                -- GetEchoQualityHex returns hex string directly
+                local coloredName = colorHex and (colorHex..s.name.."|r") or s.name
+                
+                table.insert(tipL, {text=format("  %s: +%s", coloredName, valTxt), r=0, g=1, b=0.8, wrap=false}) 
+            end
+        end
+        SetRowTip(row,"Echo: "..lbl,tipL)
         row:Show(); y=y-ROW_H end end
 
     scrollChild:SetHeight(math.abs(y)+PAD)
@@ -500,10 +681,26 @@ end
 local function CreateToggleButton() if toggleBtn then return end
     toggleBtn=CreateFrame("Button","EchoStatsToggleBtn",PaperDollFrame,"UIPanelButtonTemplate")
     toggleBtn:SetWidth(72); toggleBtn:SetHeight(22)
-    -- Anchor to bottom of character frame, less likely to conflict with other addons
-    toggleBtn:SetPoint("BOTTOMRIGHT",PaperDollFrame,"TOPRIGHT",0,2)
     toggleBtn:SetFrameStrata("HIGH")
     toggleBtn:SetText("Echoes"); toggleBtn:SetNormalFontObject("GameFontNormalSmall")
+    
+    toggleBtn:SetMovable(true)
+    toggleBtn:RegisterForDrag("LeftButton")
+    toggleBtn:SetScript("OnDragStart", toggleBtn.StartMoving)
+    toggleBtn:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        local p, _, rp, x, y = self:GetPoint()
+        EchoStatsDB.btnPos = {p, rp, x, y}
+    end)
+
+    if EchoStatsDB.btnPos then
+        toggleBtn:ClearAllPoints()
+        toggleBtn:SetPoint(EchoStatsDB.btnPos[1], UIParent, EchoStatsDB.btnPos[2], EchoStatsDB.btnPos[3], EchoStatsDB.btnPos[4])
+    else
+        -- Anchor to bottom of character frame, less likely to conflict with other addons
+        toggleBtn:SetPoint("BOTTOMRIGHT",PaperDollFrame,"TOPRIGHT",0,2)
+    end
+
     toggleBtn:SetScript("OnClick", function()
         if not panel then BuildPanel(); PopulatePanel() end
         if panel:IsShown() then panel:Hide(); panelVisible=false else panel:Show(); InvalidateCache(); PopulatePanel(); panelVisible=true end
